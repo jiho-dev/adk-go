@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
 	"net/http"
@@ -93,10 +94,29 @@ func TestNewRuntimeAPIController_PluginsAssignment(t *testing.T) {
 
 type recorderWithDeadline struct {
 	*httptest.ResponseRecorder
+	deadlines   []time.Time
+	deadlineErr error
 }
 
 func (r *recorderWithDeadline) SetWriteDeadline(t time.Time) error {
-	return nil
+	r.deadlines = append(r.deadlines, t)
+	return r.deadlineErr
+}
+
+func TestFlashEventWriteDeadlineRefreshError(t *testing.T) {
+	wantErr := errors.New("deadline failed")
+	rw := &recorderWithDeadline{
+		ResponseRecorder: httptest.NewRecorder(),
+		deadlineErr:      wantErr,
+	}
+
+	err := flashEvent(http.NewResponseController(rw), rw, "", "not written", time.Second)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("flashEvent() error = %v, want %v", err, wantErr)
+	}
+	if got := rw.Body.Len(); got != 0 {
+		t.Errorf("flashEvent() wrote %d bytes after deadline refresh failed, want 0", got)
+	}
 }
 
 type testAgentResult struct {
@@ -168,6 +188,7 @@ func TestRunSSEHandler(t *testing.T) {
 
 	for _, tt := range tc {
 		t.Run(tt.name, func(t *testing.T) {
+			startedAt := time.Now()
 			// Setup fake agent with testAgent(tt.results)
 			fakeAgent, err := agent.New(agent.Config{
 				Name: "testApp",
@@ -220,7 +241,7 @@ func TestRunSSEHandler(t *testing.T) {
 
 			// Record response
 			rr := httptest.NewRecorder()
-			w := &recorderWithDeadline{rr}
+			w := &recorderWithDeadline{ResponseRecorder: rr}
 
 			// Call handler
 			controller.RunSSEHandler(w, req)
@@ -234,6 +255,16 @@ func TestRunSSEHandler(t *testing.T) {
 			for _, s := range tt.wantBody {
 				if !strings.Contains(body, s) {
 					t.Errorf("expected body to contain %q, got %s", s, body)
+				}
+			}
+
+			wantDeadlines := len(tt.results) + 1 // Initial header flush plus one refresh per event.
+			if got := len(w.deadlines); got != wantDeadlines {
+				t.Fatalf("SetWriteDeadline calls = %d, want %d", got, wantDeadlines)
+			}
+			for _, deadline := range w.deadlines {
+				if deadline.Before(startedAt.Add(10 * time.Second)) {
+					t.Errorf("write deadline %v was not refreshed from request time %v", deadline, startedAt)
 				}
 			}
 		})
