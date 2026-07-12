@@ -142,7 +142,7 @@ func (c *RuntimeAPIController) RunSSEHandler(rw http.ResponseWriter, req *http.R
 
 	for event, err := range resp {
 		if err != nil {
-			err := flashErrorEvent(rc, rw, err)
+			err := flashErrorEvent(rc, rw, err, c.sseTimeout)
 			// The error is returned only when we cannot communicate with the client
 			// Exit the handler as connection is closed.
 			if err != nil {
@@ -160,7 +160,7 @@ func (c *RuntimeAPIController) RunSSEHandler(rw http.ResponseWriter, req *http.R
 			log.Printf("failed to marshal event: %v", err)
 			return
 		}
-		err = flashEvent(rc, rw, string(marshalledData))
+		err = flashEvent(rc, rw, "", string(marshalledData), c.sseTimeout)
 		if err != nil {
 			log.Printf("failed to flash event: %v", err)
 			return
@@ -168,20 +168,24 @@ func (c *RuntimeAPIController) RunSSEHandler(rw http.ResponseWriter, req *http.R
 	}
 }
 
-func flashErrorEvent(rc *http.ResponseController, rw http.ResponseWriter, origError error) error {
-	_, err := fmt.Fprintf(rw, "event: error\n")
-	if err != nil {
-		return fmt.Errorf("write error event: %w", err)
-	}
+func flashErrorEvent(rc *http.ResponseController, rw http.ResponseWriter, origError error, timeout time.Duration) error {
 	safeErrorJSON, err := json.Marshal(map[string]string{"error": origError.Error()})
 	if err != nil {
 		// Skip reporting error if it fails to marshal to the client (to avoid recursive error reporting).
 		return fmt.Errorf("marshal error event: %w", err)
 	}
-	return flashEvent(rc, rw, string(safeErrorJSON))
+	return flashEvent(rc, rw, "event: error\n", string(safeErrorJSON), timeout)
 }
 
-func flashEvent(rc *http.ResponseController, rw http.ResponseWriter, data string) error {
+func flashEvent(rc *http.ResponseController, rw http.ResponseWriter, prefix, data string, timeout time.Duration) error {
+	if err := rc.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return fmt.Errorf("refresh write deadline: %w", err)
+	}
+	if prefix != "" {
+		if _, err := fmt.Fprint(rw, prefix); err != nil {
+			return fmt.Errorf("write event prefix: %w", err)
+		}
+	}
 	_, err := fmt.Fprintf(rw, "data: %s\n\n", data)
 	if err != nil {
 		return fmt.Errorf("write response: %w", err)

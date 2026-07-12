@@ -36,6 +36,20 @@ type AgentEngineAPIController struct {
 	sseTimeout     time.Duration
 }
 
+type refreshingResponseWriter struct {
+	http.ResponseWriter
+	controller *http.ResponseController
+	timeout    time.Duration
+}
+
+func (w *refreshingResponseWriter) RefreshWriteDeadline() error {
+	return w.controller.SetWriteDeadline(time.Now().Add(w.timeout))
+}
+
+func (w *refreshingResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 // NewAgentEngineAPIController creates a new AgentEngineAPIController. Verifies if registered methods are unique by name
 func NewAgentEngineAPIController(service session.Service, sseTimeout time.Duration, maxPayloadSize int64, handlers []method.MethodHandler) (*AgentEngineAPIController, error) {
 	methodHandlers := map[string]method.MethodHandler{}
@@ -77,7 +91,12 @@ func (c *AgentEngineAPIController) Query(rw http.ResponseWriter, req *http.Reque
 		}
 	}
 
-	err = c.handleQuery(req.Context(), rw, payload, query.ClassMethod)
+	streamWriter := &refreshingResponseWriter{
+		ResponseWriter: rw,
+		controller:     rc,
+		timeout:        c.sseTimeout,
+	}
+	err = c.handleQuery(req.Context(), streamWriter, payload, query.ClassMethod)
 	if err != nil {
 		log.Printf("handleQuery failed: %v", err)
 		http.Error(rw, err.Error(), http.StatusInternalServerError)

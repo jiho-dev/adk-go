@@ -43,8 +43,17 @@ type rwUnwrapper interface {
 	Unwrap() http.ResponseWriter
 }
 
+type writeDeadlineRefresher interface {
+	RefreshWriteDeadline() error
+}
+
 // EmitJSON emits a line with JSON for an event.
 func EmitJSON(rw http.ResponseWriter, o any) error {
+	if refresher, ok := rw.(writeDeadlineRefresher); ok {
+		if err := refresher.RefreshWriteDeadline(); err != nil {
+			return fmt.Errorf("failed to refresh write deadline: %w", err)
+		}
+	}
 	snake := ConvertSnake(o)
 	err := json.NewEncoder(rw).Encode(snake)
 	if err != nil {
