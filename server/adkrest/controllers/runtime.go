@@ -35,18 +35,34 @@ import (
 
 // RuntimeAPIController is the controller for the Runtime API.
 type RuntimeAPIController struct {
-	sseTimeout        time.Duration
-	sessionService    session.Service
-	memoryService     memory.Service
-	artifactService   artifact.Service
-	agentLoader       agent.Loader
-	pluginConfig      runner.PluginConfig
-	autoCreateSession bool
+	sseTimeout           time.Duration
+	sseHeartbeatInterval time.Duration
+	sessionService       session.Service
+	memoryService        memory.Service
+	artifactService      artifact.Service
+	agentLoader          agent.Loader
+	pluginConfig         runner.PluginConfig
+	autoCreateSession    bool
 }
 
 // NewRuntimeAPIController creates the controller for the Runtime API.
 func NewRuntimeAPIController(sessionService session.Service, memoryService memory.Service, agentLoader agent.Loader, artifactService artifact.Service, sseTimeout time.Duration, pluginConfig runner.PluginConfig, autoCreateSession bool) *RuntimeAPIController {
 	return &RuntimeAPIController{sessionService: sessionService, memoryService: memoryService, agentLoader: agentLoader, artifactService: artifactService, sseTimeout: sseTimeout, pluginConfig: pluginConfig, autoCreateSession: autoCreateSession}
+}
+
+// NewRuntimeAPIControllerWithHeartbeat creates the controller for the Runtime API
+// with server-side SSE heartbeat enabled.
+func NewRuntimeAPIControllerWithHeartbeat(sessionService session.Service, memoryService memory.Service, agentLoader agent.Loader, artifactService artifact.Service, sseTimeout, sseHeartbeatInterval time.Duration, pluginConfig runner.PluginConfig, autoCreateSession bool) *RuntimeAPIController {
+	return &RuntimeAPIController{
+		sessionService:       sessionService,
+		memoryService:        memoryService,
+		agentLoader:          agentLoader,
+		artifactService:      artifactService,
+		sseTimeout:           sseTimeout,
+		sseHeartbeatInterval: sseHeartbeatInterval,
+		pluginConfig:         pluginConfig,
+		autoCreateSession:    autoCreateSession,
+	}
 }
 
 // RunAgent executes a non-streaming agent run for a given session and message.
@@ -138,34 +154,75 @@ func (c *RuntimeAPIController) RunSSEHandler(rw http.ResponseWriter, req *http.R
 	if runAgentRequest.StateDelta != nil {
 		opts = append(opts, runner.WithStateDelta(*runAgentRequest.StateDelta))
 	}
-	resp := r.Run(req.Context(), runAgentRequest.UserId, runAgentRequest.SessionId, &runAgentRequest.NewMessage, *rCfg, opts...)
+	streamCtx, cancelStream := context.WithCancel(req.Context())
+	defer cancelStream()
+	resp := r.Run(streamCtx, runAgentRequest.UserId, runAgentRequest.SessionId, &runAgentRequest.NewMessage, *rCfg, opts...)
+	eventCh := make(chan sseStreamItem, 1)
+	go func() {
+		defer close(eventCh)
+		for event, err := range resp {
+			select {
+			case eventCh <- sseStreamItem{event: event, err: err}:
+			case <-streamCtx.Done():
+				return
+			}
+		}
+	}()
 
-	for event, err := range resp {
-		if err != nil {
-			err := flashErrorEvent(rc, rw, err, c.sseTimeout)
+	var heartbeat <-chan time.Time
+	var heartbeatTicker *time.Ticker
+	if c.sseHeartbeatInterval > 0 {
+		heartbeatTicker = time.NewTicker(c.sseHeartbeatInterval)
+		heartbeat = heartbeatTicker.C
+		defer heartbeatTicker.Stop()
+	}
+
+	for {
+		select {
+		case item, ok := <-eventCh:
+			if !ok {
+				return
+			}
+			if item.err != nil {
+				err := flashErrorEvent(rc, rw, item.err, c.sseTimeout)
+				// The error is returned only when we cannot communicate with the client
+				// Exit the handler as connection is closed.
+				if err != nil {
+					log.Printf("failed to flash error event: %v", err)
+					return
+				}
+				continue
+			}
+			if item.event == nil {
+				continue
+			}
+			// Skip reporting error if it fails to marshal to the client (to avoid recursive error reporting).
+			marshalledData, err := json.Marshal(models.FromSessionEvent(*item.event))
+			if err != nil {
+				log.Printf("failed to marshal event: %v", err)
+				return
+			}
+			err = flashEvent(rc, rw, "", string(marshalledData), c.sseTimeout)
 			// The error is returned only when we cannot communicate with the client
 			// Exit the handler as connection is closed.
 			if err != nil {
-				log.Printf("failed to flash error event: %v", err)
+				log.Printf("failed to flash event: %v", err)
 				return
 			}
-			continue
-		}
-		if event == nil {
-			continue
-		}
-		// Skip reporting error if it fails to marshal to the client (to avoid recursive error reporting).
-		marshalledData, err := json.Marshal(models.FromSessionEvent(*event))
-		if err != nil {
-			log.Printf("failed to marshal event: %v", err)
-			return
-		}
-		err = flashEvent(rc, rw, "", string(marshalledData), c.sseTimeout)
-		if err != nil {
-			log.Printf("failed to flash event: %v", err)
+		case <-heartbeat:
+			if err := flashHeartbeatEvent(rc, rw, c.sseTimeout); err != nil {
+				log.Printf("failed to flash heartbeat event: %v", err)
+				return
+			}
+		case <-streamCtx.Done():
 			return
 		}
 	}
+}
+
+type sseStreamItem struct {
+	event *session.Event
+	err   error
 }
 
 func flashErrorEvent(rc *http.ResponseController, rw http.ResponseWriter, origError error, timeout time.Duration) error {
@@ -175,6 +232,14 @@ func flashErrorEvent(rc *http.ResponseController, rw http.ResponseWriter, origEr
 		return fmt.Errorf("marshal error event: %w", err)
 	}
 	return flashEvent(rc, rw, "event: error\n", string(safeErrorJSON), timeout)
+}
+
+func flashHeartbeatEvent(rc *http.ResponseController, rw http.ResponseWriter, timeout time.Duration) error {
+	data, err := json.Marshal(map[string]string{"type": "heartbeat", "time": time.Now().UTC().Format(time.RFC3339Nano)})
+	if err != nil {
+		return fmt.Errorf("marshal heartbeat event: %w", err)
+	}
+	return flashEvent(rc, rw, "event: heartbeat\n", string(data), timeout)
 }
 
 func flashEvent(rc *http.ResponseController, rw http.ResponseWriter, prefix, data string, timeout time.Duration) error {
