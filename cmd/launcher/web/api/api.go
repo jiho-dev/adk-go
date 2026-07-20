@@ -33,10 +33,11 @@ import (
 
 // apiConfig contains parametres for lauching ADK REST API
 type apiConfig struct {
-	frontendAddress string
-	pathPrefix      string
-	sseWriteTimeout time.Duration
-	traceCapacity   int
+	frontendAddress      string
+	pathPrefix           string
+	sseWriteTimeout      time.Duration
+	sseHeartbeatInterval time.Duration
+	traceCapacity        int
 }
 
 // apiLauncher can launch ADK REST API
@@ -76,12 +77,13 @@ func (a *apiLauncher) UserMessage(webURL string, printer func(v ...any)) {
 func (a *apiLauncher) SetupSubrouters(router *mux.Router, config *launcher.Config) error {
 	// Create the ADK REST API handler
 	restServer, err := adkrest.NewServer(adkrest.ServerConfig{
-		SessionService:  config.SessionService,
-		MemoryService:   config.MemoryService,
-		AgentLoader:     config.AgentLoader,
-		ArtifactService: config.ArtifactService,
-		SSEWriteTimeout: a.config.sseWriteTimeout,
-		PluginConfig:    config.PluginConfig,
+		SessionService:       config.SessionService,
+		MemoryService:        config.MemoryService,
+		AgentLoader:          config.AgentLoader,
+		ArtifactService:      config.ArtifactService,
+		SSEWriteTimeout:      a.config.sseWriteTimeout,
+		SSEHeartbeatInterval: a.config.sseHeartbeatInterval,
+		PluginConfig:         config.PluginConfig,
 		DebugConfig: adkrest.DebugTelemetryConfig{
 			TraceCapacity: a.config.traceCapacity,
 		},
@@ -124,6 +126,15 @@ func (a *apiLauncher) Parse(args []string) ([]string, error) {
 		p = "/" + p
 	}
 	a.config.pathPrefix = strings.TrimSuffix(p, "/")
+	if a.config.sseWriteTimeout <= 0 {
+		return nil, fmt.Errorf("sse-write-timeout must be positive")
+	}
+	if a.config.sseHeartbeatInterval < 0 {
+		return nil, fmt.Errorf("sse-heartbeat-interval must be non-negative")
+	}
+	if a.config.sseHeartbeatInterval > 0 && a.config.sseHeartbeatInterval >= a.config.sseWriteTimeout {
+		return nil, fmt.Errorf("sse-heartbeat-interval must be less than sse-write-timeout")
+	}
 
 	restArgs := a.flags.Args()
 	return restArgs, nil
@@ -142,6 +153,7 @@ func NewLauncher() weblauncher.Sublauncher {
 	fs.StringVar(&config.frontendAddress, "webui_address", "localhost:8080", "ADK WebUI address as seen from the user browser. It's used to allow CORS requests. Please specify only hostname and (optionally) port.")
 	fs.StringVar(&config.pathPrefix, "path_prefix", "/api", "ADK REST API path prefix. Default is '/api'.")
 	fs.DurationVar(&config.sseWriteTimeout, "sse-write-timeout", 120*time.Second, "SSE server write timeout (i.e. '10s', '2m' - see time.ParseDuration for details) - for writing the SSE response after reading the headers & body")
+	fs.DurationVar(&config.sseHeartbeatInterval, "sse-heartbeat-interval", 15*time.Second, "SSE heartbeat interval. Set to 0 to disable server-side heartbeat.")
 	fs.IntVar(&config.traceCapacity, "trace_capacity", 10000, "Maximum number of traces to keep in memory.")
 
 	return &apiLauncher{

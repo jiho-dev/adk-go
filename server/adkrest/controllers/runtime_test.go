@@ -136,6 +136,23 @@ func testAgent(results []testAgentResult) func(ctx agent.InvocationContext) iter
 	}
 }
 
+func delayedTestAgent(delay time.Duration, results []testAgentResult) func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+	return func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+		return func(yield func(*session.Event, error) bool) {
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return
+			}
+			for _, res := range results {
+				if !yield(res.event, res.err) {
+					return
+				}
+			}
+		}
+	}
+}
+
 func makeEvent(id, author, text string) *session.Event {
 	e := session.NewEvent(context.Background(), id)
 	e.Author = author
@@ -268,6 +285,73 @@ func TestRunSSEHandler(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRunSSEHandlerEmitsHeartbeatWhileWaitingForAgentEvent(t *testing.T) {
+	fakeAgent, err := agent.New(agent.Config{
+		Name: "testApp",
+		Run: delayedTestAgent(25*time.Millisecond, []testAgentResult{
+			{event: makeEvent("invocation-1", "testApp", "done"), err: nil},
+		}),
+	})
+	if err != nil {
+		t.Fatalf("agent.New failed: %v", err)
+	}
+
+	id := fakes.SessionKey{
+		AppName:   "testApp",
+		UserID:    "testUser",
+		SessionID: "testSession",
+	}
+	sessionService := fakes.FakeSessionService{
+		Sessions: map[fakes.SessionKey]fakes.TestSession{
+			id: {
+				Id:            id,
+				SessionState:  fakes.TestState{},
+				SessionEvents: fakes.TestEvents{},
+				UpdatedAt:     time.Now(),
+			},
+		},
+	}
+
+	controller := NewRuntimeAPIControllerWithHeartbeat(
+		&sessionService,
+		nil,
+		agent.NewSingleLoader(fakeAgent),
+		nil,
+		10*time.Second,
+		time.Millisecond,
+		runner.PluginConfig{},
+		false,
+	)
+
+	reqObj := models.RunAgentRequest{
+		AppName:   "testApp",
+		UserId:    "testUser",
+		SessionId: "testSession",
+		Streaming: true,
+		NewMessage: genai.Content{
+			Parts: []*genai.Part{{Text: "Hello"}},
+		},
+	}
+	reqBytes, _ := json.Marshal(reqObj)
+	req := httptest.NewRequest(http.MethodPost, "/run-sse", bytes.NewBuffer(reqBytes))
+
+	rr := httptest.NewRecorder()
+	w := &recorderWithDeadline{ResponseRecorder: rr}
+
+	controller.RunSSEHandler(w, req)
+
+	body := rr.Body.String()
+	if !strings.Contains(body, "event: heartbeat\n") {
+		t.Fatalf("expected heartbeat event, got %s", body)
+	}
+	if !strings.Contains(body, "done") {
+		t.Fatalf("expected final agent event, got %s", body)
+	}
+	if got := len(w.deadlines); got < 3 {
+		t.Fatalf("SetWriteDeadline calls = %d, want at least initial, heartbeat, and agent event", got)
 	}
 }
 
