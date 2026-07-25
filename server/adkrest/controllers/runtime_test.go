@@ -92,10 +92,39 @@ func TestNewRuntimeAPIController_PluginsAssignment(t *testing.T) {
 	}
 }
 
+func TestNewRuntimeAPIControllerDefaultsZeroSSEWriteTimeout(t *testing.T) {
+	controller := NewRuntimeAPIController(nil, nil, nil, nil, 0, runner.PluginConfig{}, false)
+	if controller.sseTimeout != DefaultSSEWriteTimeout {
+		t.Fatalf("sseTimeout = %v, want %v", controller.sseTimeout, DefaultSSEWriteTimeout)
+	}
+	controller = NewRuntimeAPIControllerWithHeartbeat(nil, nil, nil, nil, 0,
+		time.Second, runner.PluginConfig{}, false)
+	if controller.sseTimeout != DefaultSSEWriteTimeout {
+		t.Fatalf("heartbeat controller sseTimeout = %v, want %v",
+			controller.sseTimeout, DefaultSSEWriteTimeout)
+	}
+}
+
 type recorderWithDeadline struct {
 	*httptest.ResponseRecorder
 	deadlines   []time.Time
 	deadlineErr error
+}
+
+type failAfterFlushWriter struct {
+	*recorderWithDeadline
+	flushes int
+	failAt  int
+	err     error
+}
+
+func (w *failAfterFlushWriter) FlushError() error {
+	w.flushes++
+	if w.flushes >= w.failAt {
+		return w.err
+	}
+	w.ResponseRecorder.Flush()
+	return nil
 }
 
 func (r *recorderWithDeadline) SetWriteDeadline(t time.Time) error {
@@ -344,14 +373,128 @@ func TestRunSSEHandlerEmitsHeartbeatWhileWaitingForAgentEvent(t *testing.T) {
 	controller.RunSSEHandler(w, req)
 
 	body := rr.Body.String()
-	if !strings.Contains(body, "event: heartbeat\n") {
-		t.Fatalf("expected heartbeat event, got %s", body)
+	if !strings.Contains(body, ": heartbeat ") {
+		t.Fatalf("expected heartbeat comment, got %s", body)
+	}
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "data:") && strings.Contains(line, "heartbeat") {
+			t.Fatalf("heartbeat leaked into application data: %s", body)
+		}
 	}
 	if !strings.Contains(body, "done") {
 		t.Fatalf("expected final agent event, got %s", body)
 	}
 	if got := len(w.deadlines); got < 3 {
 		t.Fatalf("SetWriteDeadline calls = %d, want at least initial, heartbeat, and agent event", got)
+	}
+}
+
+func TestRunSSEHandlerCancelsAgentWhenClientDisconnects(t *testing.T) {
+	agentStarted := make(chan struct{})
+	agentStopped := make(chan struct{})
+	fakeAgent, err := agent.New(agent.Config{
+		Name: "testApp",
+		Run: func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			return func(func(*session.Event, error) bool) {
+				close(agentStarted)
+				<-ctx.Done()
+				close(agentStopped)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("agent.New failed: %v", err)
+	}
+	id := fakes.SessionKey{AppName: "testApp", UserID: "testUser", SessionID: "testSession"}
+	sessionService := fakes.FakeSessionService{
+		Sessions: map[fakes.SessionKey]fakes.TestSession{
+			id: {Id: id, SessionState: fakes.TestState{}, SessionEvents: fakes.TestEvents{}, UpdatedAt: time.Now()},
+		},
+	}
+	controller := NewRuntimeAPIControllerWithHeartbeat(&sessionService, nil,
+		agent.NewSingleLoader(fakeAgent), nil, time.Second, 10*time.Millisecond,
+		runner.PluginConfig{}, false)
+	reqBytes, _ := json.Marshal(models.RunAgentRequest{
+		AppName: "testApp", UserId: "testUser", SessionId: "testSession", Streaming: true,
+		NewMessage: genai.Content{Parts: []*genai.Part{{Text: "Hello"}}},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodPost, "/run-sse", bytes.NewReader(reqBytes)).WithContext(ctx)
+	handlerStopped := make(chan struct{})
+	go func() {
+		controller.RunSSEHandler(&recorderWithDeadline{ResponseRecorder: httptest.NewRecorder()}, req)
+		close(handlerStopped)
+	}()
+
+	select {
+	case <-agentStarted:
+	case <-time.After(time.Second):
+		t.Fatal("agent did not start")
+	}
+	cancel()
+	for name, stopped := range map[string]<-chan struct{}{
+		"agent": agentStopped, "handler": handlerStopped,
+	} {
+		select {
+		case <-stopped:
+		case <-time.After(time.Second):
+			t.Fatalf("%s did not stop after client disconnect", name)
+		}
+	}
+}
+
+func TestRunSSEHandlerCancelsAgentWhenHeartbeatFlushFails(t *testing.T) {
+	agentStarted := make(chan struct{})
+	agentStopped := make(chan struct{})
+	fakeAgent, err := agent.New(agent.Config{
+		Name: "testApp",
+		Run: func(ctx agent.InvocationContext) iter.Seq2[*session.Event, error] {
+			return func(func(*session.Event, error) bool) {
+				close(agentStarted)
+				<-ctx.Done()
+				close(agentStopped)
+			}
+		},
+	})
+	if err != nil {
+		t.Fatalf("agent.New failed: %v", err)
+	}
+	id := fakes.SessionKey{AppName: "testApp", UserID: "testUser", SessionID: "testSession"}
+	sessionService := fakes.FakeSessionService{Sessions: map[fakes.SessionKey]fakes.TestSession{
+		id: {Id: id, SessionState: fakes.TestState{}, SessionEvents: fakes.TestEvents{}, UpdatedAt: time.Now()},
+	}}
+	controller := NewRuntimeAPIControllerWithHeartbeat(&sessionService, nil,
+		agent.NewSingleLoader(fakeAgent), nil, time.Second, time.Millisecond,
+		runner.PluginConfig{}, false)
+	reqBytes, _ := json.Marshal(models.RunAgentRequest{
+		AppName: "testApp", UserId: "testUser", SessionId: "testSession", Streaming: true,
+		NewMessage: genai.Content{Parts: []*genai.Part{{Text: "Hello"}}},
+	})
+	writer := &failAfterFlushWriter{
+		recorderWithDeadline: &recorderWithDeadline{ResponseRecorder: httptest.NewRecorder()},
+		failAt:               2,
+		err:                  errors.New("client connection closed"),
+	}
+	handlerStopped := make(chan struct{})
+	go func() {
+		controller.RunSSEHandler(writer,
+			httptest.NewRequest(http.MethodPost, "/run-sse", bytes.NewReader(reqBytes)))
+		close(handlerStopped)
+	}()
+
+	select {
+	case <-agentStarted:
+	case <-time.After(time.Second):
+		t.Fatal("agent did not start")
+	}
+	for name, stopped := range map[string]<-chan struct{}{
+		"agent": agentStopped, "handler": handlerStopped,
+	} {
+		select {
+		case <-stopped:
+		case <-time.After(time.Second):
+			t.Fatalf("%s did not stop after heartbeat flush failure", name)
+		}
 	}
 }
 

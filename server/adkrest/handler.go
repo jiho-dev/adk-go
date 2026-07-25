@@ -35,6 +35,19 @@ import (
 
 // NewServer creates a new ADK REST API server which implements [http.Handler] interface.
 func NewServer(cfg ServerConfig) (*Server, error) {
+	if cfg.SSEWriteTimeout < 0 {
+		return nil, fmt.Errorf("SSEWriteTimeout must be non-negative")
+	}
+	if cfg.SSEWriteTimeout == 0 {
+		cfg.SSEWriteTimeout = controllers.DefaultSSEWriteTimeout
+	}
+	if cfg.SSEHeartbeatInterval < 0 {
+		return nil, fmt.Errorf("SSEHeartbeatInterval must be non-negative")
+	}
+	if cfg.SSEHeartbeatInterval > 0 && cfg.SSEHeartbeatInterval >= cfg.SSEWriteTimeout {
+		return nil, fmt.Errorf("SSEHeartbeatInterval must be less than SSEWriteTimeout")
+	}
+
 	debugTelemetry, err := services.NewDebugTelemetryWithConfig(&services.DebugTelemetryConfig{
 		TraceCapacity: cfg.DebugConfig.TraceCapacity,
 	})
