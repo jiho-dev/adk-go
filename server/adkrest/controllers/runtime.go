@@ -45,9 +45,20 @@ type RuntimeAPIController struct {
 	autoCreateSession    bool
 }
 
+// DefaultSSEWriteTimeout is used when an SSE controller is created without an
+// explicit write timeout.
+const DefaultSSEWriteTimeout = 120 * time.Second
+
+func normalizeSSEWriteTimeout(timeout time.Duration) time.Duration {
+	if timeout <= 0 {
+		return DefaultSSEWriteTimeout
+	}
+	return timeout
+}
+
 // NewRuntimeAPIController creates the controller for the Runtime API.
 func NewRuntimeAPIController(sessionService session.Service, memoryService memory.Service, agentLoader agent.Loader, artifactService artifact.Service, sseTimeout time.Duration, pluginConfig runner.PluginConfig, autoCreateSession bool) *RuntimeAPIController {
-	return &RuntimeAPIController{sessionService: sessionService, memoryService: memoryService, agentLoader: agentLoader, artifactService: artifactService, sseTimeout: sseTimeout, pluginConfig: pluginConfig, autoCreateSession: autoCreateSession}
+	return &RuntimeAPIController{sessionService: sessionService, memoryService: memoryService, agentLoader: agentLoader, artifactService: artifactService, sseTimeout: normalizeSSEWriteTimeout(sseTimeout), pluginConfig: pluginConfig, autoCreateSession: autoCreateSession}
 }
 
 // NewRuntimeAPIControllerWithHeartbeat creates the controller for the Runtime API
@@ -58,7 +69,7 @@ func NewRuntimeAPIControllerWithHeartbeat(sessionService session.Service, memory
 		memoryService:        memoryService,
 		agentLoader:          agentLoader,
 		artifactService:      artifactService,
-		sseTimeout:           sseTimeout,
+		sseTimeout:           normalizeSSEWriteTimeout(sseTimeout),
 		sseHeartbeatInterval: sseHeartbeatInterval,
 		pluginConfig:         pluginConfig,
 		autoCreateSession:    autoCreateSession,
@@ -235,11 +246,16 @@ func flashErrorEvent(rc *http.ResponseController, rw http.ResponseWriter, origEr
 }
 
 func flashHeartbeatEvent(rc *http.ResponseController, rw http.ResponseWriter, timeout time.Duration) error {
-	data, err := json.Marshal(map[string]string{"type": "heartbeat", "time": time.Now().UTC().Format(time.RFC3339Nano)})
-	if err != nil {
-		return fmt.Errorf("marshal heartbeat event: %w", err)
+	if err := rc.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		return fmt.Errorf("refresh heartbeat write deadline: %w", err)
 	}
-	return flashEvent(rc, rw, "event: heartbeat\n", string(data), timeout)
+	if _, err := fmt.Fprintf(rw, ": heartbeat %s\n\n", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return fmt.Errorf("write heartbeat: %w", err)
+	}
+	if err := rc.Flush(); err != nil {
+		return fmt.Errorf("flush heartbeat: %w", err)
+	}
+	return nil
 }
 
 func flashEvent(rc *http.ResponseController, rw http.ResponseWriter, prefix, data string, timeout time.Duration) error {
