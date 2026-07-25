@@ -35,6 +35,19 @@ import (
 
 // NewServer creates a new ADK REST API server which implements [http.Handler] interface.
 func NewServer(cfg ServerConfig) (*Server, error) {
+	if cfg.SSEWriteTimeout < 0 {
+		return nil, fmt.Errorf("SSEWriteTimeout must be non-negative")
+	}
+	if cfg.SSEWriteTimeout == 0 {
+		cfg.SSEWriteTimeout = controllers.DefaultSSEWriteTimeout
+	}
+	if cfg.SSEHeartbeatInterval < 0 {
+		return nil, fmt.Errorf("SSEHeartbeatInterval must be non-negative")
+	}
+	if cfg.SSEHeartbeatInterval > 0 && cfg.SSEHeartbeatInterval >= cfg.SSEWriteTimeout {
+		return nil, fmt.Errorf("SSEHeartbeatInterval must be less than SSEWriteTimeout")
+	}
+
 	debugTelemetry, err := services.NewDebugTelemetryWithConfig(&services.DebugTelemetryConfig{
 		TraceCapacity: cfg.DebugConfig.TraceCapacity,
 	})
@@ -47,7 +60,7 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 	// where the ADK REST API will be served.
 	setupRouter(router,
 		routers.NewSessionsAPIRouter(controllers.NewSessionsAPIController(cfg.SessionService)),
-		routers.NewRuntimeAPIRouter(controllers.NewRuntimeAPIController(cfg.SessionService, cfg.MemoryService, cfg.AgentLoader, cfg.ArtifactService, cfg.SSEWriteTimeout, cfg.PluginConfig, false)),
+		routers.NewRuntimeAPIRouter(controllers.NewRuntimeAPIControllerWithHeartbeat(cfg.SessionService, cfg.MemoryService, cfg.AgentLoader, cfg.ArtifactService, cfg.SSEWriteTimeout, cfg.SSEHeartbeatInterval, cfg.PluginConfig, false)),
 		routers.NewAppsAPIRouter(controllers.NewAppsAPIController(cfg.AgentLoader)),
 		routers.NewDebugAPIRouter(controllers.NewDebugAPIController(cfg.SessionService, cfg.AgentLoader, debugTelemetry)),
 		routers.NewArtifactsAPIRouter(controllers.NewArtifactsAPIController(cfg.ArtifactService)),
@@ -61,13 +74,14 @@ func NewServer(cfg ServerConfig) (*Server, error) {
 
 // ServerConfig contains parameters for the ADK REST API server.
 type ServerConfig struct {
-	SessionService  session.Service
-	MemoryService   memory.Service
-	AgentLoader     agent.Loader
-	ArtifactService artifact.Service
-	SSEWriteTimeout time.Duration
-	PluginConfig    runner.PluginConfig
-	DebugConfig     DebugTelemetryConfig
+	SessionService       session.Service
+	MemoryService        memory.Service
+	AgentLoader          agent.Loader
+	ArtifactService      artifact.Service
+	SSEWriteTimeout      time.Duration
+	SSEHeartbeatInterval time.Duration
+	PluginConfig         runner.PluginConfig
+	DebugConfig          DebugTelemetryConfig
 }
 
 // DebugTelemetryConfig contains parameters for the debug telemetry.
